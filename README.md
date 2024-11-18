@@ -1,9 +1,9 @@
 ## Demo-starter-foundry
 
 
-* Install foundry: ¨¨¨¨curl -L https://foundry.paradigm.xyz | bash¨¨¨
-* ¨¨¨¨foundryup¨¨¨¨
-* forge build (we can ignore the error for now)
+* Install foundry: ```curl -L https://foundry.paradigm.xyz | bash```
+* ```foundryup```
+* ```forge build``` (we can ignore the error for now)
 
 
 
