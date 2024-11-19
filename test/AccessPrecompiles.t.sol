@@ -10,12 +10,27 @@ contract PrecompileTest is Test {
     address internal constant RANDOM_BYTES = 0x0100000000000000000000000000000000000001;
     address internal constant DERIVE_KEY = 0x0100000000000000000000000000000000000002;
     address internal constant ENCRYPT = 0x0100000000000000000000000000000000000003;
+    address internal constant GENERATE_SIGNING_KEYPAIR = 0x0100000000000000000000000000000000000005;
     address internal constant CURVE25519_PUBLIC_KEY = 0x0100000000000000000000000000000000000008;
     address internal constant SUBCALL = 0x0100000000000000000000000000000000000103;
+    
 
     // Types for curve25519 keys
     type Curve25519PublicKey is bytes32;
     type Curve25519SecretKey is bytes32;
+
+    // Define SigningAlg enum to match Sapphire library
+    enum SigningAlg {
+        Ed25519Oasis,
+        Ed25519Pure,
+        Ed25519PrehashedSha512,
+        Secp256k1Oasis,
+        Secp256k1PrehashedKeccak256,
+        Secp256k1PrehashedSha256,
+        Sr25519,
+        Secp256r1PrehashedSha256,
+        Secp384r1PrehashedSha384
+    }
 
     function setUp() public {
         // Create fork to enable vm.rpc calls
@@ -167,5 +182,37 @@ contract PrecompileTest is Test {
         bytes memory ciphertext = vm.rpc("eth_call", transactionArgs);
         console.log("ENCRYPT:", vm.toString(ciphertext));
         assertTrue(ciphertext.length > 0, "Ciphertext should not be empty");
+    }
+
+    function testGenerateSigningKeyPair() public {
+        // Generate random seed for key generation
+        string[] memory inputs = new string[](2);
+        inputs[0] = vm.toString(RANDOM_BYTES);
+        inputs[1] = vm.toString(abi.encode(32, ""));
+        string memory transactionArgs = string.concat(
+            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
+        );
+        bytes memory seed = vm.rpc("eth_call", transactionArgs);
+        console.log("Random seed:");
+        console.logBytes(seed);
+
+        // Generate Ed25519Pure keypair
+        inputs[0] = vm.toString(GENERATE_SIGNING_KEYPAIR);
+        inputs[1] = vm.toString(abi.encode(SigningAlg.Ed25519Pure, seed));
+        transactionArgs = string.concat(
+            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
+        );
+        bytes memory result = vm.rpc("eth_call", transactionArgs);
+        console.log("Generate signing keypair result:");
+        console.logBytes(result);
+
+        (bytes memory publicKey, bytes memory secretKey) = abi.decode(result, (bytes, bytes));
+        console.log("Public key:");
+        console.logBytes(publicKey);
+        console.log("Secret key:");
+        console.logBytes(secretKey);
+
+        assertEq(publicKey.length, 32, "Ed25519 public key should be 32 bytes");
+        assertEq(secretKey.length, 32, "Ed25519 secret key should be 32 bytes");
     }
 }
