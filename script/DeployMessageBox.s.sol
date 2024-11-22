@@ -4,50 +4,27 @@ pragma solidity ^0.8.19;
 import {Script} from "forge-std/Script.sol";
 import "forge-std/console.sol";
 import {MessageBox} from "../src/MessageBox.sol";
-// import {encryptCallDataOnlyData} from "../lib/sapphire-paratime/contracts/contracts/CalldataEncryption.sol";
+// import {SapphireSign, DataPack} from "./SapphireSign.sol";
 import "./CBOR.sol" as CBOR;
 
-// Define the interface for the MessageBox contract based on the ABI
-interface IMessageBox {
-    function getMessage() external view returns (string memory);
-    function setMessage(string memory newMessage) external;
-}
 
 contract MessageBoxScript is Script {
     MessageBox public messageBox;
 
     // Oasis-specific, confidential precompiles
-    address internal constant RANDOM_BYTES =
-        0x0100000000000000000000000000000000000001;
     address internal constant DERIVE_KEY =
         0x0100000000000000000000000000000000000002;
     address internal constant ENCRYPT =
         0x0100000000000000000000000000000000000003;
     address internal constant DECRYPT =
         0x0100000000000000000000000000000000000004;
-    address internal constant GENERATE_SIGNING_KEYPAIR =
-        0x0100000000000000000000000000000000000005;
-    address internal constant SIGN_DIGEST =
-        0x0100000000000000000000000000000000000006;
-    address internal constant VERIFY_DIGEST =
-        0x0100000000000000000000000000000000000007;
     address internal constant CURVE25519_PUBLIC_KEY =
         0x0100000000000000000000000000000000000008;
-    address internal constant GAS_USED =
-        0x0100000000000000000000000000000000000009;
-    address internal constant PAD_GAS =
-        0x010000000000000000000000000000000000000a;
+
 
     // Oasis-specific, general precompiles
-    address internal constant SHA512_256 =
-        0x0100000000000000000000000000000000000101;
-    address internal constant SHA512 =
-        0x0100000000000000000000000000000000000102;
     address internal constant SUBCALL =
         0x0100000000000000000000000000000000000103;
-    address internal constant SHA384 =
-        0x0100000000000000000000000000000000000104;
-
     string private constant CORE_CALLDATAPUBLICKEY = "core.CallDataPublicKey";
 
     type Curve25519PublicKey is bytes32;
@@ -66,7 +43,7 @@ contract MessageBoxScript is Script {
     
     function setUp() public {
         // Create fork to enable vm.rpc
-        vm.createSelectFork("sapphire_testnet");
+        vm.createSelectFork("sapphire_localnet");
         
     }
 
@@ -155,15 +132,143 @@ contract MessageBoxScript is Script {
     }
 
     // Helper to detect if we're in simulation
-    function isSimulation() internal view returns (bool) {
+    function isSimulation() internal returns (bool) {
         uint256 chainId;
         assembly {
             chainId := chainid()
         }
-        console.log("Chain ID:", chainId);
-        // Foundry's default chainid for simulation is 31337
-        return chainId != 0x5aff;
+        return chainId != 0x5afd;
     }
+
+    function encryptCalldata(bytes memory indata) internal returns (bytes memory encryptedCalldata)
+    {
+        
+        Curve25519PublicKey myPublic;
+        Curve25519SecretKey mySecret;
+
+        bytes memory privateKeyCurve25519 = abi.encodePacked((vm.randomUint()));
+        console.log("RANDOM_BYTES: ", vm.toString(privateKeyCurve25519));
+
+        // Twiddle some bits, as per RFC 7748 §5.
+        privateKeyCurve25519[0] &= 0xf8; // Make it a multiple of 8 to avoid small subgroup attacks.
+        privateKeyCurve25519[31] &= 0x7f; // Clamp to < 2^255 - 19
+        privateKeyCurve25519[31] |= 0x40; // Clamp to >= 2^254
+
+        // Create the transaction arguments as a structured object
+        string memory transactionArgs = string.concat(
+            "[{\"to\":\"", vm.toString(CURVE25519_PUBLIC_KEY), "\",\"data\":\"", 
+            vm.toString(privateKeyCurve25519), "\"}, \"latest\"]"
+        );
+        bytes memory pubKeyCurve25519 = vm.rpc("eth_call", transactionArgs);
+        console.log("CURVE25519_PUBLIC_KEY: ", vm.toString(pubKeyCurve25519));
+
+        (myPublic, mySecret) = (
+            Curve25519PublicKey.wrap(bytes32(pubKeyCurve25519)),
+            Curve25519SecretKey.wrap(bytes32(privateKeyCurve25519))
+        );
+
+        bytes15 nonce = bytes15(abi.encodePacked(vm.randomUint()));
+        console.log("NONCE: ", vm.toString(nonce));
+
+        CallDataPublicKey memory cdpk;
+        uint256 epoch;
+
+        transactionArgs = string.concat(
+            "[{\"to\":\"", 
+            vm.toString(SUBCALL),
+            "\",\"data\":\"",
+            vm.toString(abi.encode("core.CallDataPublicKey", hex"f6")),
+            "\"}, \"latest\"]"
+        );
+        console.log("inputs: ", transactionArgs);
+        bytes memory tmp = vm.rpc("eth_call", transactionArgs);
+        console.log("core.CallDataPublicKey: ", vm.toString(tmp));
+        (uint64 status, bytes memory data) = abi.decode(tmp, (uint64, bytes));
+        console.log(vm.toString(status), vm.toString(data));
+        
+        if (status != 0) {
+            revert CoreCallDataPublicKeyError(status);
+        }
+        (epoch, cdpk) = _parseCBORCallDataPublicKey(data);
+        console.logBytes(vm.rpc("oasis_callDataPublicKey", "[]"));
+                
+        bytes memory plaintextEnvelope = abi.encodePacked(
+            hex"a1", // map(1)
+            hex"64", //     text(4) "body"
+            "body",
+            CBOR.encodeBytes(indata)
+        );
+
+        transactionArgs = string.concat(
+            "[{\"to\":\"",
+            vm.toString(DERIVE_KEY),
+            "\",\"data\":\"",
+            vm.toString(abi.encode(Curve25519PublicKey.wrap(cdpk.key),
+                                    mySecret)),
+            "\"}, \"latest\"]"
+        );
+        bytes memory symmetric = vm.rpc("eth_call", transactionArgs);
+        console.log(vm.toString(symmetric));
+
+        transactionArgs = string.concat(
+            "[{\"to\":\"",
+            vm.toString(ENCRYPT),
+            "\",\"data\":\"",
+            vm.toString(abi.encode(bytes32(symmetric),
+                        bytes32(nonce),
+                        plaintextEnvelope,
+                        hex"")),
+            "\"}, \"latest\"]"
+        );
+        bytes memory ciphertext = vm.rpc("eth_call", transactionArgs);
+        console.log("Ciphertext: ", vm.toString(ciphertext));
+
+        console.log(vm.toString(CBOR.encodeUint(epoch)));
+        encryptedCalldata = abi.encodePacked(
+                hex"a2", //  map(2)
+                hex"64", //      text(4) "body"
+                "body",
+                hex"a4", //          map(4)
+                hex"62", //              text(2) "pk"
+                "pk",
+                hex"5820", //                 bytes(32)
+                myPublic,
+                hex"64", //              text(4) "data"
+                "data",
+                CBOR.encodeBytes(ciphertext), //     bytes(n) inner
+                hex"65", //              text(5) "epoch"
+                "epoch",
+                CBOR.encodeUint(epoch), // 
+                hex"65", //              text(5) "nonce"
+                "nonce",
+                hex"4f", //                  bytes(15) nonce
+                nonce,
+                hex"66", //      text(6) "format"
+                "format",
+                hex"01" //      unsigned(1)
+            );
+    }
+
+    function decryptCalldata(bytes32 key, bytes32 nonce, bytes memory encrypted) internal returns (bytes memory encryptedCalldata){
+        
+        string memory transactionArgs = string.concat(
+            "[{\"to\":\"",
+            vm.toString(DECRYPT),
+            "\",\"data\":\"",
+            vm.toString(
+                abi.encode(
+                    key,
+                    nonce,
+                    encrypted,
+                    hex"")
+                    ),
+            "\"}, \"latest\"]"
+        );
+        bytes memory decrypted = vm.rpc("eth_call", transactionArgs);
+        return decrypted;        
+    }
+
+
 
     function run() public {
         // Exit early if we're in simulation
@@ -177,147 +282,47 @@ contract MessageBoxScript is Script {
 
         // Deploy MessageBox
         messageBox = new MessageBox();
-        // IMessageBox messageBox = IMessageBox(messageBoxAddress);
 
+        // send_transaction with unencrypted calldata
         messageBox.setMessage("Hello!");
 
-        // Prepare getMessage() calldata
-        bytes memory getMessageCalldata = abi.encodeWithSignature("getMessage()");
+        // send_transaction with encrypted calldata
+        // Get the full calldata
+        bytes memory setMessageCalldata = abi.encodeWithSignature(
+            "setMessage(string)",
+            "Hello encrypted!"
+        );
+        bytes memory encryptedCalldata = encryptCalldata(setMessageCalldata);
+        (bool success,) = address(messageBox).call(encryptedCalldata);
+
+        bytes memory fun_sig = abi.encodeWithSignature("greet()");
         
+        encryptedCalldata = encryptCalldata(fun_sig);
 
-        Curve25519PublicKey myPublic;
-        Curve25519SecretKey mySecret;
+        // Send the call with unencrypted calldata
+        (success,) = address(messageBox).call(fun_sig);
 
-        string[] memory inputs = new string[](2);
-        inputs[0] = vm.toString(RANDOM_BYTES);
-        inputs[1] = vm.toString(abi.encode(32, ""));
-        // Create the transaction arguments as a structured object
-        string memory transactionArgs = string.concat(
-            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
-        );
-
-        // Call eth_call with the structured transaction object in an array
-        bytes memory scalar = vm.rpc("eth_call", transactionArgs);
-        console.log("RANDOM_BYTES: ", vm.toString(scalar));
-
-        // Twiddle some bits, as per RFC 7748 §5.
-        scalar[0] &= 0xf8; // Make it a multiple of 8 to avoid small subgroup attacks.
-        scalar[31] &= 0x7f; // Clamp to < 2^255 - 19
-        scalar[31] |= 0x40; // Clamp to >= 2^254
-
-        inputs = new string[](2);
-        inputs[0] = vm.toString(CURVE25519_PUBLIC_KEY);
-        inputs[1] = vm.toString(scalar);
-        // Create the transaction arguments as a structured object
-        transactionArgs = string.concat(
-            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
-        );
-        bytes memory pkBytes = vm.rpc("eth_call", transactionArgs);
-        console.log("CURVE25519_PUBLIC_KEY: ", vm.toString(pkBytes));
-
-        bytes32 mySecret2 = bytes32(scalar);
-        (myPublic, mySecret) = (
-            Curve25519PublicKey.wrap(bytes32(pkBytes)),
-            Curve25519SecretKey.wrap(bytes32(scalar))
-        );
-
-        inputs[0] = vm.toString(RANDOM_BYTES);
-        inputs[1] = vm.toString(abi.encode(15, ""));
-        // Create the transaction arguments as a structured object
-        transactionArgs = string.concat(
-            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
-        );
-        scalar = vm.rpc("eth_call", transactionArgs);
-        console.log("RANDOM_BYTES: ", vm.toString(scalar));
-
-        bytes15 nonce = bytes15(scalar);
-        CallDataPublicKey memory cdpk;
-        uint256 epoch;
-
-        inputs[0] = vm.toString(SUBCALL);
-        inputs[1] = vm.toString(abi.encode("core.CallDataPublicKey", hex"f6"));
-        transactionArgs = string.concat(
-            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
-        );
-        console.log("inputs: ", transactionArgs);
-        bytes memory tmp = vm.rpc("eth_call", transactionArgs);
-        console.log("core.CallDataPublicKey: ", vm.toString(tmp));
-        (uint64 status, bytes memory data) = abi.decode(tmp, (uint64, bytes));
-        console.log(vm.toString(status), vm.toString(data));
+        // Send the call with encrypted calldata
+        (success,) = address(messageBox).call(encryptedCalldata);
+        console.log("Function signature:", vm.toString(fun_sig));
         
-        if (status != 0) {
-            revert CoreCallDataPublicKeyError(status);
-        }
+        // address from = vm.addr(deployerPrivateKey);
+        // address to = address(MessageBox);
 
-        (epoch, cdpk) = _parseCBORCallDataPublicKey(data);
-        
-        bytes memory plaintextEnvelope = abi.encodePacked(
-            hex"a1", // map(1)
-            hex"64", //     text(4) "body"
-            "body",
-            CBOR.encodeBytes(getMessageCalldata)
-        );
+        // // Get packed data with signature
+        // bytes memory packed = SapphireSign.signAndPackData(
+        //     encryptedCallData,
+        //     callData,
+        //     from,
+        //     to,
+        //     privateKey
+        // );
 
-        console.logBytes32(cdpk.key);
-        inputs[0] = vm.toString(DERIVE_KEY);
-        console.log("Key: ", vm.toString(cdpk.key));
-        console.log("secret: ", vm.toString(mySecret2));
-        inputs[1] = vm.toString(abi.encode(Curve25519PublicKey.wrap(cdpk.key), mySecret));
-        transactionArgs = string.concat(
-            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
-        );
-        bytes memory symmetric = vm.rpc("eth_call", transactionArgs);
-        console.log(vm.toString(symmetric));
+        // // If you need individual components, can also do:
+        // Call memory call = SapphireSign.createCall(from, to, callData);
+        // bytes memory signature = SapphireSign.signCall(call, privateKey);
+        // bytes memory packed2 = SapphireSign.packData(encryptedCallData, call.leash, signature)
 
-        inputs[0] = vm.toString(ENCRYPT);
-        inputs[1] = vm.toString(abi.encode(symmetric, nonce, plaintextEnvelope, hex"40"));
-        transactionArgs = string.concat(
-            "[{\"to\":\"", inputs[0], "\",\"data\":\"", inputs[1], "\"}, \"latest\"]"
-        );
-        bytes memory ciphertext = vm.rpc("eth_call", transactionArgs);
-        console.log("Ciphertext: ", vm.toString(ciphertext));
-
-        console.log(vm.toString(CBOR.encodeUint(epoch)));
-        bytes memory encryptedCalldata = abi.encodePacked(
-                hex"a2", //  map(2)
-                hex"64", //      text(4) "body"
-                "body",
-                hex"a3", //          map(3)
-                hex"62", //              text(2) "pk"
-                "pk",
-                hex"5820", //                 bytes(32)
-                myPublic,
-                hex"64", //              text(4) "data"
-                "data",
-                CBOR.encodeBytes(ciphertext), //     bytes(n) inner
-                // hex"65", //              text(5) "epoch"
-                // "epoch",
-                // CBOR.encodeUint(epoch), // 
-                hex"65", //              text(5) "nonce"
-                "nonce",
-                hex"4f", //                  bytes(15) nonce
-                nonce,
-                hex"66", //      text(6) "format"
-                "format",
-                hex"01" //      unsigned(1)
-            );
-
-        string memory messageBoxAddressStr = vm.toString(address(messageBox));
-
-        transactionArgs = string.concat(
-            "[{\"to\":\"", messageBoxAddressStr, "\",\"data\":\"", vm.toString(encryptedCalldata), "\"}, \"latest\"]"
-        );
-        
-        // Make the call with encrypted calldata
-        bytes memory result_gas = vm.rpc("eth_estimateGas", transactionArgs);
-        // (bool success, bytes memory result) = address(messageBox).call("getMessage()");
-        // string memory result = messageBox.getMessage();
-        // Send the transaction using vm.rpc
-        (bool success, bytes memory result) = address(messageBox).call(encryptedCalldata);
-        console.log(vm.toString(encryptedCalldata));
-        console.log(vm.toString(result_gas));
-
-        
         vm.stopBroadcast();
     }
 }

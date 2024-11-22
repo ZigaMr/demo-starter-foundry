@@ -10,6 +10,10 @@ contract MessageBox {
         author = msg.sender;
     }
 
+    function greet() public view returns (string memory) {
+        return _message;
+    }
+
     function getMessage() external view returns (string memory) {
         // if (msg.sender != author) {
         //     revert("not allowed");
