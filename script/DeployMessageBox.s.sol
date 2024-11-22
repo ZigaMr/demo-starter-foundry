@@ -43,7 +43,7 @@ contract MessageBoxScript is Script {
     
     function setUp() public {
         // Create fork to enable vm.rpc
-        vm.createSelectFork("sapphire_localnet");
+        vm.createSelectFork("sapphire_testnet");
         
     }
 
@@ -137,7 +137,7 @@ contract MessageBoxScript is Script {
         assembly {
             chainId := chainid()
         }
-        return chainId != 0x5afd;
+        return chainId != 0x5aff;
     }
 
     function encryptCalldata(bytes memory indata) internal returns (bytes memory encryptedCalldata)
@@ -305,7 +305,7 @@ contract MessageBoxScript is Script {
         // Send the call with encrypted calldata
         (success,) = address(messageBox).call(encryptedCalldata);
         console.log("Function signature:", vm.toString(fun_sig));
-        
+
         // address from = vm.addr(deployerPrivateKey);
         // address to = address(MessageBox);
 
